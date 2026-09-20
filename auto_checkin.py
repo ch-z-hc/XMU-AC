@@ -4,6 +4,7 @@ XMU Tronclass 全自动签到脚本
 - Cookie 持久化（重启免登录）
 - 数字签到：API 直接抓码 → 提交
 - GPS 签到：两条线三角定位自动算坐标 → 提交
+- 签到节流：等班级超过 CHECKIN_RATIO 的人签过之后再签（避免第一个签）
 - 内置看门狗：崩溃自动重启
 
 用法:
@@ -31,6 +32,11 @@ STUDENT_ID = os.environ.get("STUDENT_ID")
 PASSWORD = os.environ.get("PASSWORD")
 INTERVAL = 15           # 轮询间隔秒数
 # GPS 坐标通过三角定位自动获取，无需手动填写
+
+# ---- 签到节流（等同学先签）----
+CHECKIN_RATIO = 0.30        # 已签到比例超过此值才轮到自己签；0 = 关闭
+CHECKIN_MAX_WAIT = 120      # 最多等多少秒，超时后直接签到
+CHECKIN_MIN_REMAINING = 20  # 距签到结束不足此秒数时不再等待，立即签到
 # ============================================================
 
 if not STUDENT_ID:
@@ -242,6 +248,57 @@ def check_rollcall_status(rollcall_id, session):
     return None
 
 
+def get_signed_stats(rollcall_id, session):
+    """查询本次签到的已签人数，返回 (signed, total) 或 (None, None)。
+
+    班级名单里的记录在学生签到时才写 updated_at，据此计已签人数；
+    名单总人数即本班应到人数。
+    """
+    url = f"{BASE_URL}/api/rollcall/{rollcall_id}/student_rollcalls"
+    try:
+        r = session.get(url, timeout=10)
+        if r.status_code != 200:
+            return None, None
+        data = r.json()
+        students = data.get("student_rollcalls") if isinstance(data, dict) else None
+        if not isinstance(students, list) or not students:
+            return None, None
+        signed = sum(
+            1 for s in students
+            if isinstance(s, dict) and (s.get("updated_at") or s.get("status") == "on_call_fine")
+        )
+        return signed, len(students)
+    except Exception as e:
+        print(f"  [X] 查询签到人数失败: {e}")
+        return None, None
+
+
+def checkin_gate(rollcall_id, session, end_time, waited_sec):
+    """判断要不要为了等同学先签而推迟本次签到。
+
+    返回 (need_wait, msg)：need_wait 为 True 时本轮跳过，下个轮询周期再试。
+    拿不到人数、已达标、等太久或剩余时间不足时立即放行，错过签到比晚签更糟。
+    """
+    if CHECKIN_RATIO <= 0:
+        return False, ""
+
+    signed, total = get_signed_stats(rollcall_id, session)
+    if signed is None:
+        return False, ""
+
+    ratio = signed / total
+    msg = f"已签到 {signed}/{total} ({ratio:.0%})"
+    if ratio > CHECKIN_RATIO:
+        return False, msg + " 达标，开签"
+
+    remaining = _time_remaining(end_time)
+    if waited_sec >= CHECKIN_MAX_WAIT:
+        return False, msg + f" 等待超 {CHECKIN_MAX_WAIT}s，直接签"
+    if remaining is not None and remaining <= CHECKIN_MIN_REMAINING:
+        return False, msg + f" 剩余 {int(remaining)}s 不足，直接签"
+    return True, msg + f" 未达 {CHECKIN_RATIO:.0%}，继续等"
+
+
 # ============================================================
 # GPS 三角定位（两条线交点反推目标坐标）
 # ============================================================
@@ -404,17 +461,29 @@ ACTIVE_STATUSES = {
 }
 
 
-def _end_time_passed(end_time):
-    """检查 end_time 是否已过"""
+def _parse_end_time(end_time):
+    """解析 end_time 为带时区的 datetime，失败返回 None"""
     if not end_time:
-        return False
+        return None
     try:
         dt = datetime.fromisoformat(str(end_time).replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt < datetime.now(timezone.utc)
     except Exception:
-        return False
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _end_time_passed(end_time):
+    """检查 end_time 是否已过"""
+    dt = _parse_end_time(end_time)
+    return dt is not None and dt < datetime.now(timezone.utc)
+
+
+def _time_remaining(end_time):
+    """距 end_time 还剩多少秒，无 end_time 或解析失败返回 None"""
+    dt = _parse_end_time(end_time)
+    return None if dt is None else (dt - datetime.now(timezone.utc)).total_seconds()
 
 
 def _is_terminal(status, end_time):
@@ -481,6 +550,7 @@ def dashboard(courses, seen_count, query_count, start_time, events):
         f"时间: {t}    运行: {rt}",
         f"课程: {len(courses)} 门    查询: {query_count} 次",
         "GPS : 自动三角定位",
+        f"节流: 等 {CHECKIN_RATIO:.0%} 同学先签" if CHECKIN_RATIO > 0 else "节流: 关闭",
         sep,
     ]:
         _cline(line)
@@ -520,6 +590,7 @@ def main_loop():
     # 3. 监控循环
     seen = set()                # 已处理终端 / 已成功签到的 rid
     unknown_retries = {}        # rid → 未知状态重试次数
+    ratio_wait_since = {}       # rid → 首次因签到比例不足而等待的时间戳
     events = []
     query_count = 0
     start_time = time.time()
@@ -559,6 +630,7 @@ def main_loop():
                     # 终端状态 → 标记已处理，不再重试
                     if _is_terminal(status, end_time):
                         seen.add(rid)
+                        ratio_wait_since.pop(rid, None)
                         continue
 
                     # API 返回 status=None（详情接口失败）→ 限次重试
@@ -582,7 +654,24 @@ def main_loop():
 
                     # 可以尝试签到
                     rtype = rollcall_label(rc)
-                    events.append(f"[NEW] {name} ({rtype})")
+
+                    # 签到节流：等班级超过 CHECKIN_RATIO 的人签过之后再签。
+                    # 等待期间 [NEW] 只报一次，否则每个轮询周期都会刷屏。
+                    if rc.get("is_number") or rc.get("is_radar"):
+                        now_rid = time.time()
+                        if rid not in ratio_wait_since:
+                            events.append(f"[NEW] {name} ({rtype})")
+                            ratio_wait_since[rid] = now_rid
+                        need_wait, gate_msg = checkin_gate(
+                            rid, session, end_time, now_rid - ratio_wait_since[rid])
+                        if need_wait:
+                            events.append(f"[WAIT] {name} {gate_msg}")
+                            continue
+                        ratio_wait_since.pop(rid, None)
+                        if gate_msg:
+                            events.append(f"[GO] {name} {gate_msg}")
+                    else:
+                        events.append(f"[NEW] {name} ({rtype})")
 
                     if rc.get("is_number") and not rc.get("is_radar"):
                         if code:
