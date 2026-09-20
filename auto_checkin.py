@@ -5,6 +5,7 @@ XMU Tronclass 全自动签到脚本
 - 数字签到：API 直接抓码 → 提交
 - GPS 签到：两条线三角定位自动算坐标 → 提交
 - 签到节流：等班级超过 CHECKIN_RATIO 的人签过之后再签（避免第一个签）
+  已签人数按名单每人的 rollcall_status 统计
 - 内置看门狗：崩溃自动重启
 
 用法:
@@ -248,11 +249,31 @@ def check_rollcall_status(rollcall_id, session):
     return None
 
 
-def get_signed_stats(rollcall_id, session):
-    """查询本次签到的已签人数，返回 (signed, total) 或 (None, None)。
+# 名单里判断「某人已签到」的依据：优先用每人的 rollcall_status（签到后变
+# on_call_fine）；若接口无此字段，退回旧口径（签到时才写 updated_at）。
+SIGNED_STUDENT_STATUS = "on_call_fine"
 
-    班级名单里的记录在学生签到时才写 updated_at，据此计已签人数；
-    名单总人数即本班应到人数。
+
+def _student_signed(rec, use_status):
+    """按名单里的单条记录判断该学生是否已签到。
+
+    use_status 在名单层面统一定口径，且看字段是否存在而不是看值：无人签到时
+    rollcall_status 会全为 null，按值判断会误退回 updated_at；也不逐条判断，
+    已签者有值、未签者为 null 的接口逐条退回会把未签算成已签。
+    """
+    if use_status:
+        return rec.get("rollcall_status") == SIGNED_STUDENT_STATUS
+    return bool(rec.get("updated_at"))
+
+
+def get_signed_stats(rollcall_id, session):
+    """统计本次签到的已签人数，返回 (signed, total) 或 (None, None)。
+
+    total 取名单长度，即本班应到人数。
+
+    走到调用点说明本机还没签到，所以若判据把自己也算成已签，说明它与
+    接口口径不符（例如拿建记录就有值的 updated_at 当已签）：此时按「拿不到
+    人数」处理并告警，宁可立即签到也不因错判而卡住。
     """
     url = f"{BASE_URL}/api/rollcall/{rollcall_id}/student_rollcalls"
     try:
@@ -263,11 +284,17 @@ def get_signed_stats(rollcall_id, session):
         students = data.get("student_rollcalls") if isinstance(data, dict) else None
         if not isinstance(students, list) or not students:
             return None, None
-        signed = sum(
-            1 for s in students
-            if isinstance(s, dict) and (s.get("updated_at") or s.get("status") == "on_call_fine")
-        )
-        return signed, len(students)
+        students = [s for s in students if isinstance(s, dict)]
+        if not students:
+            return None, None        # 全被过滤时不能让下游除零
+        use_status = any("rollcall_status" in s for s in students)
+        me = next((s for s in students
+                   if s.get("user_no") is not None and str(s["user_no"]) == str(STUDENT_ID)),
+                  None)
+        if me is not None and _student_signed(me, use_status):
+            print("  [!] 签到人数判据与接口不符（自己未签却被计为已签），本次不节流")
+            return None, None
+        return sum(1 for s in students if _student_signed(s, use_status)), len(students)
     except Exception as e:
         print(f"  [X] 查询签到人数失败: {e}")
         return None, None
@@ -630,7 +657,6 @@ def main_loop():
                     # 终端状态 → 标记已处理，不再重试
                     if _is_terminal(status, end_time):
                         seen.add(rid)
-                        ratio_wait_since.pop(rid, None)
                         continue
 
                     # API 返回 status=None（详情接口失败）→ 限次重试
@@ -657,7 +683,10 @@ def main_loop():
 
                     # 签到节流：等班级超过 CHECKIN_RATIO 的人签过之后再签。
                     # 等待期间 [NEW] 只报一次，否则每个轮询周期都会刷屏。
-                    if rc.get("is_number") or rc.get("is_radar"):
+                    # 一旦放行就不再重新等（保留 ratio_wait_since 里的时间戳，
+                    # 否则提交失败后下个周期又从头等 120s，短时点名会直接过期）。
+                    # CHECKIN_RATIO=0 时整块跳过，保持无节流时的原始行为。
+                    if CHECKIN_RATIO > 0 and (rc.get("is_number") or rc.get("is_radar")):
                         now_rid = time.time()
                         if rid not in ratio_wait_since:
                             events.append(f"[NEW] {name} ({rtype})")
@@ -667,7 +696,6 @@ def main_loop():
                         if need_wait:
                             events.append(f"[WAIT] {name} {gate_msg}")
                             continue
-                        ratio_wait_since.pop(rid, None)
                         if gate_msg:
                             events.append(f"[GO] {name} {gate_msg}")
                     else:
@@ -695,6 +723,9 @@ def main_loop():
                     else:
                         events.append(f"[!] {name} 不支持的签到类型")
                         seen.add(rid)  # 不支持的类型，无法处理
+
+            # 已签到或已结束的 rid 不必再占着等待记录
+            ratio_wait_since = {k: v for k, v in ratio_wait_since.items() if k not in seen}
 
             last_poll = now
 

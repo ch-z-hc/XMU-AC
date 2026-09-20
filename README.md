@@ -37,7 +37,9 @@ CHECKIN_MIN_REMAINING = 20  # 距签到结束不足 20 秒不再等，立即签
 [GO] 高等数学 已签到 8/20 (40%) 达标，开签
 ```
 
-拿不到名单（接口异常、返回空）时立即签到，不因节流错过签到。
+已签人数按名单里每人的 `rollcall_status == "on_call_fine"` 统计（名单接口 `GET /api/rollcall/{id}/student_rollcalls`），总人数即名单长度；若接口没有 `rollcall_status` 字段则退回按 `updated_at` 是否写入判。注意名单里每人的 `updated_at` 从建记录起就有值（等于点名创建时间），`status` 恒为 `on_call`，**都不能**用来判已签。
+
+拿不到名单（接口异常、返回空）或自校发现判据与接口口径不符（自己还没签却被算成已签）时立即签到，不因节流错过签到。
 
 ## 声明
 
