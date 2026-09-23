@@ -6,7 +6,8 @@ XMU Tronclass 全自动签到脚本
 - GPS 签到：两条线三角定位自动算坐标 → 提交
   提交后按名单里本人那条 rollcall_status 确认是否真签上（不是看点名状态）
 - 签到节流：等班级超过 CHECKIN_RATIO 的人签过之后再签（避免第一个签）
-  已签人数按名单每人的 rollcall_status 统计
+  已签人数按名单每人的 rollcall_status 统计；没到比例就继续等，
+  只在点名快结束时（CHECKIN_MIN_REMAINING）才破例直接签
 - 内置看门狗：崩溃自动重启
 
 用法:
@@ -37,8 +38,11 @@ INTERVAL = 15           # 轮询间隔秒数
 
 # ---- 签到节流（等同学先签）----
 CHECKIN_RATIO = 0.30        # 已签到比例超过此值才轮到自己签；0 = 关闭
-CHECKIN_MAX_WAIT = 120      # 最多等多少秒，超时后直接签到
 CHECKIN_MIN_REMAINING = 20  # 距签到结束不足此秒数时不再等待，立即签到
+# 这里**故意没有**「等够多少秒就先签」那条兜底（原 CHECKIN_MAX_WAIT，已删：
+# 没到比例就继续等）。剩下的唯一保底是上面那个「快结束了就直接签」，
+# 它防的是全班都没到 30% 时直接缺勤。所以删掉超时兜底的同时必须把 GPS 那条路
+# 的 end_time 补上（见主循环里的注释），否则这条保底对 GPS 签到压根是死的。
 # ============================================================
 
 if not STUDENT_ID:
@@ -213,15 +217,18 @@ def get_rollcalls(course_id, session, student_id):
     return []
 
 
-def get_number_code(rollcall_id, session):
-    """返回 (number_code, status, end_time) 或 (None, None, None)"""
+def get_rollcall_detail(rollcall_id, session):
+    """读点名详情接口，返回 (number_code, 点名级 status, end_time) 或 (None, None, None)。
+
+    ⚠️ 这里的 status 是**点名本身**的状态（in_progress / finished…），不是本人签没签上；
+    数字签到取码、GPS 签到取 end_time 都用这个接口，本人的状态看课程列表或名单。"""
     url = f"{BASE_URL}/api/rollcall/{rollcall_id}/student_rollcalls"
     try:
         r = session.get(url, timeout=10)
         data = r.json()
         return data.get("number_code"), data.get("status"), data.get("end_time")
     except Exception as e:
-        print(f"  [X] 抓取签到码失败: {e}")
+        print(f"  [X] 读取点名详情失败: {e}")
         return None, None, None
 
 
@@ -325,11 +332,14 @@ def get_signed_stats(rollcall_id, session):
         return None, None
 
 
-def checkin_gate(rollcall_id, session, end_time, waited_sec):
+def checkin_gate(rollcall_id, session, end_time):
     """判断要不要为了等同学先签而推迟本次签到。
 
     返回 (need_wait, msg)：need_wait 为 True 时本轮跳过，下个轮询周期再试。
-    拿不到人数、已达标、等太久或剩余时间不足时立即放行，错过签到比晚签更糟。
+    只有两种情况会不等比例达标就放行：拿不到人数（接口异常），以及本次点名
+    只剩 CHECKIN_MIN_REMAINING 秒了（防全班没到 30% 时直接缺勤）。
+    以前还有一条「等超 N 秒直接签」的超时兜底，已删：没到比例就接着等。
+    取向不变：宁可退化成不节流，也不能退化成为了等比例而错过签到。
     """
     if CHECKIN_RATIO <= 0:
         return False, ""
@@ -344,8 +354,6 @@ def checkin_gate(rollcall_id, session, end_time, waited_sec):
         return False, msg + " 达标，开签"
 
     remaining = _time_remaining(end_time)
-    if waited_sec >= CHECKIN_MAX_WAIT:
-        return False, msg + f" 等待超 {CHECKIN_MAX_WAIT}s，直接签"
     if remaining is not None and remaining <= CHECKIN_MIN_REMAINING:
         return False, msg + f" 剩余 {int(remaining)}s 不足，直接签"
     return True, msg + f" 未达 {CHECKIN_RATIO:.0%}，继续等"
@@ -661,7 +669,7 @@ def main_loop():
     # 3. 监控循环
     seen = set()                # 已处理终端 / 已成功签到的 rid
     unknown_retries = {}        # rid → 未知状态重试次数
-    ratio_wait_since = {}       # rid → 首次因签到比例不足而等待的时间戳
+    throttle_waiting = set()    # 已报过 [NEW]、还没收尾的 rid（[NEW] 只报一次靠它）
     events = []
     query_count = 0
     start_time = time.time()
@@ -690,20 +698,28 @@ def main_loop():
                     if not rid or rid in seen:
                         continue
 
-                    # 获取详情
-                    if rc.get("is_number") and not rc.get("is_radar"):
-                        code, status, end_time = get_number_code(rid, session)
-                    elif rc.get("is_radar"):
-                        code, status, end_time = None, rc.get("status"), rc.get("end_time")
-                    else:
-                        code, status, end_time = None, None, None
+                    # 详情：本人状态一律看课程列表里那条的 status（未签 = absent、
+                    # 签上 = on_call_fine）；详情接口只用来取数字签到码和结束时间。
+                    # ⚠️ 详情顶层的 status 是**点名级**的（in_progress / finished），拿它判
+                    # “我该不该接着处理”会出两类错，都是 2026-09-23 实测到的：GPS 那边
+                    # 永远不终态（把已经签成功的报成 [FAIL]），数字那边则会把自己已签上、
+                    # 但点名还没结束的那场重复签一遍（重启后最容易撞上）。
+                    # 列表里也不给 end_time（恒 None），所以结束时间只能从详情取。
+                    is_num = rc.get("is_number") and not rc.get("is_radar")
+                    is_radar = bool(rc.get("is_radar"))
+                    code = end_time = None
+                    if is_num:
+                        code, _, end_time = get_rollcall_detail(rid, session)
+                    elif is_radar:
+                        _, _, end_time = get_rollcall_detail(rid, session)
+                    status = rc.get("status") if (is_num or is_radar) else None
 
                     # 终端状态 → 标记已处理，不再重试
                     if _is_terminal(status, end_time):
-                        # 之前对它发过起签（进过 ratio_wait_since）才补一行收尾，
+                        # 之前对它报过 [NEW]（进过 throttle_waiting）才补一行收尾，
                         # 否则日志会停在 [FAIL] 将重试 上看不出最终结果；
                         # 启动时批量吐掉的历史点名不在里面，不会刷屏。
-                        if rid in ratio_wait_since:
+                        if rid in throttle_waiting:
                             events.append(f"[END] {name} 不再处理，当前状态 {status}")
                         seen.add(rid)
                         continue
@@ -732,16 +748,15 @@ def main_loop():
 
                     # 签到节流：等班级超过 CHECKIN_RATIO 的人签过之后再签。
                     # 等待期间 [NEW] 只报一次，否则每个轮询周期都会刷屏。
-                    # 一旦放行就不再重新等（保留 ratio_wait_since 里的时间戳，
-                    # 否则提交失败后下个周期又从头等 120s，短时点名会直接过期）。
+                    # 以前这个集合记的是首次等待时刻，用来算「等超 N 秒就先签」；那条保底
+                    # 已去掉，所以这里只剩「[NEW] 只报一次」这个用途。
+                    # 没到比例就一直等，只剩结尾那个 CHECKIN_MIN_REMAINING 保底。
                     # CHECKIN_RATIO=0 时整块跳过，保持无节流时的原始行为。
                     if CHECKIN_RATIO > 0 and (rc.get("is_number") or rc.get("is_radar")):
-                        now_rid = time.time()
-                        if rid not in ratio_wait_since:
+                        if rid not in throttle_waiting:
                             events.append(f"[NEW] {name} ({rtype})")
-                            ratio_wait_since[rid] = now_rid
-                        need_wait, gate_msg = checkin_gate(
-                            rid, session, end_time, now_rid - ratio_wait_since[rid])
+                            throttle_waiting.add(rid)
+                        need_wait, gate_msg = checkin_gate(rid, session, end_time)
                         if need_wait:
                             events.append(f"[WAIT] {name} {gate_msg}")
                             continue
@@ -774,7 +789,7 @@ def main_loop():
                         seen.add(rid)  # 不支持的类型，无法处理
 
             # 已签到或已结束的 rid 不必再占着等待记录
-            ratio_wait_since = {k: v for k, v in ratio_wait_since.items() if k not in seen}
+            throttle_waiting -= seen
 
             last_poll = now
 
