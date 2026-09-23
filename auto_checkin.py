@@ -6,8 +6,7 @@ XMU Tronclass 全自动签到脚本
 - GPS 签到：两条线三角定位自动算坐标 → 提交
   提交后按名单里本人那条 rollcall_status 确认是否真签上（不是看点名状态）
 - 签到节流：等班级超过 CHECKIN_RATIO 的人签过之后再签（避免第一个签）
-  已签人数按名单每人的 rollcall_status 统计；没到比例就继续等，
-  只在点名快结束时（CHECKIN_MIN_REMAINING）才破例直接签
+  已签人数按名单每人的 rollcall_status 统计；没到比例就一直等，宁可缺勤也不提前签
 - 内置看门狗：崩溃自动重启
 
 用法:
@@ -38,11 +37,12 @@ INTERVAL = 15           # 轮询间隔秒数
 
 # ---- 签到节流（等同学先签）----
 CHECKIN_RATIO = 0.30        # 已签到比例超过此值才轮到自己签；0 = 关闭
-CHECKIN_MIN_REMAINING = 20  # 距签到结束不足此秒数时不再等待，立即签到
-# 这里**故意没有**「等够多少秒就先签」那条兜底（原 CHECKIN_MAX_WAIT，已删：
-# 没到比例就继续等）。剩下的唯一保底是上面那个「快结束了就直接签」，
-# 它防的是全班都没到 30% 时直接缺勤。所以删掉超时兜底的同时必须把 GPS 那条路
-# 的 end_time 补上（见主循环里的注释），否则这条保底对 GPS 签到压根是死的。
+# 判据只有比例这一条，**没有任何时间兜底**：原来的
+# 「等超 CHECKIN_MAX_WAIT 直接签」和「只剩 CHECKIN_MIN_REMAINING 直接签」
+# 两条都已删掉 —— 没到比例就干脆不签。
+# 不签也不等于卡住：点名有没有结束靠 end_time 判（见 _is_terminal），到点会打一行
+# [END] 收尾并从轮询里摘掉；而 end_time 只有详情接口给（课程列表里恒为 None）。
+# 唯一还绕过比例的情况是名单接口异常、拿不到人数 —— 那时是「不知道」而不是「没到」。
 # ============================================================
 
 if not STUDENT_ID:
@@ -332,14 +332,13 @@ def get_signed_stats(rollcall_id, session):
         return None, None
 
 
-def checkin_gate(rollcall_id, session, end_time):
-    """判断要不要为了等同学先签而推迟本次签到。
+def checkin_gate(rollcall_id, session):
+    """判断这一轮要不要因为「同学签得还不够」而不签。
 
     返回 (need_wait, msg)：need_wait 为 True 时本轮跳过，下个轮询周期再试。
-    只有两种情况会不等比例达标就放行：拿不到人数（接口异常），以及本次点名
-    只剩 CHECKIN_MIN_REMAINING 秒了（防全班没到 30% 时直接缺勤）。
-    以前还有一条「等超 N 秒直接签」的超时兜底，已删：没到比例就接着等。
-    取向不变：宁可退化成不节流，也不能退化成为了等比例而错过签到。
+    判据只有比例这一条，没有时间兜底：没超过 CHECKIN_RATIO 就一直等，等到点名结束
+    也不签（宁可缺勤也不当那一小批人）。名单接口异常、拿不到人数时照样放行 ——
+    那是「不知道」不是「没到」，别让它把签到卡死。
     """
     if CHECKIN_RATIO <= 0:
         return False, ""
@@ -353,9 +352,6 @@ def checkin_gate(rollcall_id, session, end_time):
     if ratio > CHECKIN_RATIO:
         return False, msg + " 达标，开签"
 
-    remaining = _time_remaining(end_time)
-    if remaining is not None and remaining <= CHECKIN_MIN_REMAINING:
-        return False, msg + f" 剩余 {int(remaining)}s 不足，直接签"
     return True, msg + f" 未达 {CHECKIN_RATIO:.0%}，继续等"
 
 
@@ -559,12 +555,6 @@ def _end_time_passed(end_time):
     return dt is not None and dt < datetime.now(timezone.utc)
 
 
-def _time_remaining(end_time):
-    """距 end_time 还剩多少秒，无 end_time 或解析失败返回 None"""
-    dt = _parse_end_time(end_time)
-    return None if dt is None else (dt - datetime.now(timezone.utc)).total_seconds()
-
-
 def _is_terminal(status, end_time):
     """判断签到是否已终止（成功或过期），不应再重试。"""
     if status in TERMINAL_STATUSES:
@@ -704,7 +694,8 @@ def main_loop():
                     # “我该不该接着处理”会出两类错，都是 2026-09-23 实测到的：GPS 那边
                     # 永远不终态（把已经签成功的报成 [FAIL]），数字那边则会把自己已签上、
                     # 但点名还没结束的那场重复签一遍（重启后最容易撞上）。
-                    # 列表里也不给 end_time（恒 None），所以结束时间只能从详情取。
+                    # 列表里也不给 end_time（恒 None），而「点名结束了没有」全靠它判 ——
+                    # 没到比例的那些就是靠它收尾的，不然会永远在轮询里空转。
                     is_num = rc.get("is_number") and not rc.get("is_radar")
                     is_radar = bool(rc.get("is_radar"))
                     code = end_time = None
@@ -746,17 +737,14 @@ def main_loop():
                     # 可以尝试签到
                     rtype = rollcall_label(rc)
 
-                    # 签到节流：等班级超过 CHECKIN_RATIO 的人签过之后再签。
+                    # 签到节流：等班级超过 CHECKIN_RATIO 的人签过之后再签，没到就一直等。
                     # 等待期间 [NEW] 只报一次，否则每个轮询周期都会刷屏。
-                    # 以前这个集合记的是首次等待时刻，用来算「等超 N 秒就先签」；那条保底
-                    # 已去掉，所以这里只剩「[NEW] 只报一次」这个用途。
-                    # 没到比例就一直等，只剩结尾那个 CHECKIN_MIN_REMAINING 保底。
                     # CHECKIN_RATIO=0 时整块跳过，保持无节流时的原始行为。
                     if CHECKIN_RATIO > 0 and (rc.get("is_number") or rc.get("is_radar")):
                         if rid not in throttle_waiting:
                             events.append(f"[NEW] {name} ({rtype})")
                             throttle_waiting.add(rid)
-                        need_wait, gate_msg = checkin_gate(rid, session, end_time)
+                        need_wait, gate_msg = checkin_gate(rid, session)
                         if need_wait:
                             events.append(f"[WAIT] {name} {gate_msg}")
                             continue
