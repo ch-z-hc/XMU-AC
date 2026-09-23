@@ -41,6 +41,21 @@ CHECKIN_MIN_REMAINING = 20  # 距签到结束不足 20 秒不再等，立即签
 
 拿不到名单（接口异常、返回空）或自校发现判据与接口口径不符（自己还没签却被算成已签）时立即签到，不因节流错过签到。
 
+## GPS 签到与成功判定
+
+GPS（雷达）点名先往两个探针坐标各提一次：命中就直接用，未命中则拿响应里的 `distance` 做两圆相交，反解出目标坐标后提交候选点。
+
+⚠️ **签到成没成功只能看「本人」的状态**，别看点名的状态。两个接口的 `status` 不是一回事：
+
+| 接口 | `status` 含义 | 见过的值 |
+| --- | --- | --- |
+| `GET /api/course/{id}/student/{sid}/rollcalls` | 本人在该条点名里的状态 | `absent`（未签）、`on_call_fine`（已签） |
+| `GET /api/rollcall/{id}/student_rollcalls` 顶层 | 点名本身的状态 | `in_progress`、`finished` |
+
+拿顶层 `status` 比 `on_call_fine` 永远不相等，会把**已经签上的** GPS 签到报成失败（曾经踩过）；所以提交后统一回查名单里 `user_no` 等于本人学号那条的 `rollcall_status`（`check_my_checkin_status`）。
+
+若教师本次没有限制签到范围，探针坐标会被直接接受（名单里本人的 `distance` 为 `None`），日志里的坐标只是探针值，不代表真实位置。
+
 ## 声明
 
 本项目仅供技术交流与学习，请勿用于非法用途。

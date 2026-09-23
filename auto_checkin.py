@@ -4,6 +4,7 @@ XMU Tronclass 全自动签到脚本
 - Cookie 持久化（重启免登录）
 - 数字签到：API 直接抓码 → 提交
 - GPS 签到：两条线三角定位自动算坐标 → 提交
+  提交后按名单里本人那条 rollcall_status 确认是否真签上（不是看点名状态）
 - 签到节流：等班级超过 CHECKIN_RATIO 的人签过之后再签（避免第一个签）
   已签人数按名单每人的 rollcall_status 统计
 - 内置看门狗：崩溃自动重启
@@ -235,20 +236,6 @@ def answer_number(rollcall_id, code, session):
         return False
 
 
-def check_rollcall_status(rollcall_id, session):
-    """回查签到状态，返回 status 字符串或 None"""
-    try:
-        r = session.get(
-            f"{BASE_URL}/api/rollcall/{rollcall_id}/student_rollcalls",
-            timeout=10,
-        )
-        if r.status_code == 200:
-            return r.json().get("status")
-    except Exception as e:
-        print(f"  [X] 回查状态失败: {e}")
-    return None
-
-
 # 名单里判断「某人已签到」的依据：优先用每人的 rollcall_status（签到后变
 # on_call_fine）；若接口无此字段，退回旧口径（签到时才写 updated_at）。
 SIGNED_STUDENT_STATUS = "on_call_fine"
@@ -264,6 +251,46 @@ def _student_signed(rec, use_status):
     if use_status:
         return rec.get("rollcall_status") == SIGNED_STUDENT_STATUS
     return bool(rec.get("updated_at"))
+
+
+def _find_me(students):
+    """在名单里找本人那条记录，找不到返回 None（调用方要能区分「没签上」和「认不出自己」）"""
+    return next((s for s in students if isinstance(s, dict)
+                 and s.get("user_no") is not None
+                 and str(s["user_no"]) == str(STUDENT_ID)), None)
+
+
+def check_my_checkin_status(rollcall_id, session, retries=3, delay=0.4):
+    """回查「本人」在本次签到里的状态，返回名单里的 rollcall_status（签上后为 on_call_fine）。
+
+    ⚠️ 只能读名单里自己那条 rollcall_status。详情接口顶层的 status 是**点名本身**的状态
+    （in_progress / finished…），跟本人签没签上无关；拿它判成功会把已经签上的 GPS 签到
+    报成失败（2026-09-23 实测踩过）。
+    提交后服务端落库有延迟，所以带几次重读。
+    """
+    url = f"{BASE_URL}/api/rollcall/{rollcall_id}/student_rollcalls"
+    status = None
+    for i in range(retries):
+        try:
+            r = session.get(url, timeout=10)
+            if r.status_code != 200:
+                return None
+            students = r.json().get("student_rollcalls")
+            if not isinstance(students, list):
+                return None
+            me = _find_me(students)
+            if me is None:
+                print("  [!] 名单里没找到本人记录，无法确认签到结果")
+                return None
+            status = me.get("rollcall_status")
+            if status == SIGNED_STUDENT_STATUS:
+                return status
+        except Exception as e:
+            print(f"  [X] 回查本人状态失败: {e}")
+            return None
+        if i < retries - 1:
+            time.sleep(delay)
+    return status
 
 
 def get_signed_stats(rollcall_id, session):
@@ -288,9 +315,7 @@ def get_signed_stats(rollcall_id, session):
         if not students:
             return None, None        # 全被过滤时不能让下游除零
         use_status = any("rollcall_status" in s for s in students)
-        me = next((s for s in students
-                   if s.get("user_no") is not None and str(s["user_no"]) == str(STUDENT_ID)),
-                  None)
+        me = _find_me(students)
         if me is not None and _student_signed(me, use_status):
             print("  [!] 签到人数判据与接口不符（自己未签却被计为已签），本次不节流")
             return None, None
@@ -411,7 +436,9 @@ def _solve_target(lat1, lon1, lat2, lon2, d1, d2):
 def answer_radar_auto(rollcall_id, session):
     """GPS 签到：两条线三角定位，自动算目标坐标。
 
-    返回 (success, lat, lon)。提交后回查状态确认 on_call_fine。
+    返回 (success, lat, lon)。提交后回查名单里本人的 rollcall_status 确认签上（
+    详情接口顶层的 status 是点名本身的状态，不能拿来判成功，见
+    check_my_checkin_status 的注释）。
     """
     url = f"{BASE_URL}/api/rollcall/{rollcall_id}/answer"
 
@@ -429,14 +456,16 @@ def answer_radar_auto(rollcall_id, session):
         print(f"  探针请求失败: {e}")
         return False, None, None
 
-    # 探针直接命中（已在范围内）
+    # 探针直接命中（本次点名不限制范围 / 探针坐标已在范围内，不限制时名单里
+    # 本人的 distance 为 None）。
+    # 两次都 200 时按最后一次报坐标；服务端最终留哪一次无从核对，别当精确事实。
+    hit = None
     for r, lat, lon in [(r1, PROBE_LAT1, PROBE_LON1), (r2, PROBE_LAT2, PROBE_LON2)]:
         if r.status_code == 200:
-            status = check_rollcall_status(rollcall_id, session)
-            if status == "on_call_fine":
-                print(f"  探针命中，状态确认: {status}")
-                return True, lat, lon
-            print(f"  探针命中但状态为 {status}，尝试精确坐标...")
+            hit = (lat, lon)
+    if hit is not None and check_my_checkin_status(rollcall_id, session) == SIGNED_STUDENT_STATUS:
+        print(f"  探针命中，本人状态已确认: {SIGNED_STUDENT_STATUS}")
+        return True, hit[0], hit[1]
 
     try:
         d1 = r1.json().get("distance")
@@ -446,7 +475,14 @@ def answer_radar_auto(rollcall_id, session):
         return False, None, None
 
     if d1 is None or d2 is None:
+        # 既没签上又拿不到距离 = 三角定位这条路当场废掉。把原始响应记下来，
+        # 下次出这问题能直接看出是接口换了形状还是返回了别的错。
         print(f"  未获取到距离: d1={d1}, d2={d2}")
+        for tag, r in (("探针1", r1), ("探针2", r2)):
+            try:
+                print(f"    {tag} HTTP {r.status_code} 响应: {str(r.text)[:200]}")
+            except Exception:
+                pass
         return False, None, None
 
     print(f"  探针距离: d1={d1}m, d2={d2}m")
@@ -462,11 +498,11 @@ def answer_radar_auto(rollcall_id, session):
         try:
             r = session.put(url, json=_payload(lat, lon), timeout=10)
             if r.status_code == 200:
-                status = check_rollcall_status(rollcall_id, session)
-                if status == "on_call_fine":
-                    print(f"  精确坐标命中，状态确认: {status}")
+                status = check_my_checkin_status(rollcall_id, session)
+                if status == SIGNED_STUDENT_STATUS:
+                    print(f"  精确坐标命中，本人状态已确认: {status}")
                     return True, lat, lon
-                print(f"  坐标提交 200 但状态为 {status}，尝试下一个...")
+                print(f"  坐标提交 200 但本人状态为 {status}，尝试下一个...")
         except Exception as e:
             print(f"  候选坐标提交异常: {e}")
 
@@ -479,12 +515,20 @@ def answer_radar_auto(rollcall_id, session):
 # ============================================================
 
 # 终端状态：签到成功、已结束、已过期、已关闭、已请假
+# （on_call_fine 是「本人已签上」，名单接口本人那条的 rollcall_status / 课程列表的 status）
 TERMINAL_STATUSES = {"finished", "expired", "closed", "on_call_fine", "on_personal_leave"}
 
-# 明确活跃的状态（可尝试签到）
+# 明确活跃的状态（可尝试签到）。
+# ⚠️ 两个接口的 status 不同口径：课程列表（GET /api/course/{cid}/student/{sid}/rollcalls）
+# 给的是「本人在本次点名里的状态」（未签时为 absent，签上后 on_call_fine）；
+# 点名详情（GET /api/rollcall/{rid}/student_rollcalls）顶层的 status 是「点名本身」
+# 的状态（in_progress / finished…）。两套名字都归到下面两个集合里，所以哪个接口
+# 的状态都能拿来判「还要不要接着处理」；但**判签有没有成功只能用本人的状态**，
+# 见 check_my_checkin_status。
+# absent 不放进这里的话，GPS 签到的每个轮询周期会多一行 [?] 未知状态值 刷屏。
 ACTIVE_STATUSES = {
-    "active", "on_going", "on_coming", "started",
-    "waiting", "pending", "not_started", "in_progress",
+    "active", "on_going", "on_coming", "started", "in_progress",
+    "waiting", "pending", "not_started", "absent",
 }
 
 
@@ -656,6 +700,11 @@ def main_loop():
 
                     # 终端状态 → 标记已处理，不再重试
                     if _is_terminal(status, end_time):
+                        # 之前对它发过起签（进过 ratio_wait_since）才补一行收尾，
+                        # 否则日志会停在 [FAIL] 将重试 上看不出最终结果；
+                        # 启动时批量吐掉的历史点名不在里面，不会刷屏。
+                        if rid in ratio_wait_since:
+                            events.append(f"[END] {name} 不再处理，当前状态 {status}")
                         seen.add(rid)
                         continue
 
