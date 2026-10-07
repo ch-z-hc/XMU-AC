@@ -703,7 +703,7 @@ def main_loop():
                         code, _, end_time = get_rollcall_detail(rid, session)
                     elif is_radar:
                         _, _, end_time = get_rollcall_detail(rid, session)
-                    status = rc.get("status") if (is_num or is_radar) else None
+                    status = rc.get("status")
 
                     # 终端状态 → 标记已处理，不再重试
                     if _is_terminal(status, end_time):
@@ -715,7 +715,13 @@ def main_loop():
                         seen.add(rid)
                         continue
 
-                    # API 返回 status=None（详情接口失败）→ 限次重试
+                    # 非数字 / GPS 点名无法自动提交，不应当成状态获取失败重试。
+                    if not (is_num or is_radar):
+                        events.append(f"[SKIP] {name} 不支持的签到类型，跳过")
+                        seen.add(rid)
+                        continue
+
+                    # 课程列表未返回本人 status → 限次重试
                     if status is None:
                         retries = unknown_retries.get(rid, 0)
                         if retries >= MAX_UNKNOWN_RETRIES:
@@ -771,10 +777,6 @@ def main_loop():
                             events.append(f"[OK] GPS {name} ({lat:.4f}, {lon:.4f})")
                         else:
                             events.append(f"[FAIL] GPS {name} 将重试")
-
-                    else:
-                        events.append(f"[!] {name} 不支持的签到类型")
-                        seen.add(rid)  # 不支持的类型，无法处理
 
             # 已签到或已结束的 rid 不必再占着等待记录
             throttle_waiting -= seen
