@@ -20,6 +20,14 @@ $env:PASSWORD = "密码"
 python auto_checkin.py
 ```
 
+## 数字签到取码
+
+优先读取旧明细接口 `GET /api/rollcall/{id}/student_rollcalls` 的 `number_code`；缺码时补查 `GET /api/timetable_rollcalls?course_ids={course_id}&rollcall_date=YYYY-MM-DD`。日期取课程点名记录 `rollcall_time` 的 UTC 日期，不直接使用北京时间；缺少有效时间或课程 ID 时不补查。
+
+补查结果只接受点名 ID 和课程 ID 都匹配的四位数字字符串，保留前导零。不缓存签到码；补查失败或没有匹配记录时不提交，等下一轮重查。人数、本人状态、结束时间仍沿用旧接口，GPS 和节流逻辑不变。
+
+离线回归检查：`python test_number_code.py`，不需要账号或第三方依赖，不会访问网络或执行真实签到。
+
 ## 签到节流（等同学先签）
 
 默认不当第一个签到的人：提交前先查本次签到的班级名单，等已签到比例**超过 30%** 再签。参数在 `auto_checkin.py` 顶部：

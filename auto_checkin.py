@@ -232,6 +232,37 @@ def get_rollcall_detail(rollcall_id, session):
         return None, None, None
 
 
+def get_number_code_from_timetable(rollcall_id, course_id, rollcall_time, session):
+    """旧明细缺码时，按课程和点名开始时间的 UTC 日期补查数字码。"""
+    started = _parse_end_time(rollcall_time)
+    if course_id is None or started is None:
+        return None
+    try:
+        r = session.get(
+            f"{BASE_URL}/api/timetable_rollcalls",
+            params={"course_ids": str(course_id),
+                    "rollcall_date": started.astimezone(timezone.utc).date().isoformat()},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if not isinstance(data, dict) or not isinstance(data.get("rollcalls"), list):
+            return None
+        for item in data["rollcalls"]:
+            if not isinstance(item, dict) or str(item.get("id")) != str(rollcall_id):
+                continue
+            course = item.get("course")
+            if not isinstance(course, dict) or str(course.get("id")) != str(course_id):
+                continue
+            code = item.get("number_code")
+            if isinstance(code, str) and len(code) == 4 and code.isascii() and code.isdigit():
+                return code
+    except Exception as e:
+        print(f"  [X] 日期接口取码失败: {e}")
+    return None
+
+
 def answer_number(rollcall_id, code, session):
     url = f"{BASE_URL}/api/rollcall/{rollcall_id}/answer_number_rollcall"
     payload = {"deviceId": str(uuid.uuid4()), "numberCode": str(code)}
@@ -760,6 +791,9 @@ def main_loop():
                         events.append(f"[NEW] {name} ({rtype})")
 
                     if rc.get("is_number") and not rc.get("is_radar"):
+                        if not code:
+                            code = get_number_code_from_timetable(
+                                rid, cid, rc.get("rollcall_time"), session)
                         if code:
                             ok = answer_number(rid, code, session)
                             if ok:
