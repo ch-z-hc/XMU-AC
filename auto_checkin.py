@@ -206,15 +206,29 @@ def get_courses(session):
     return unique
 
 
+class RollcallSessionExpired(RuntimeError):
+    pass
+
+
 def get_rollcalls(course_id, session, student_id):
     url = f"{BASE_URL}/api/course/{course_id}/student/{student_id}/rollcalls?page=1&page_size=20"
     r = session.get(url, timeout=10)
-    data = r.json()
-    if isinstance(data, list):
-        return data
+    # 不输出响应正文 / 跳转 URL，避免把登录票据写进日志。
+    info = (f"HTTP {r.status_code}, Content-Type={r.headers.get('Content-Type', '未知')}, "
+            f"重定向={'是' if r.history else '否'}")
+    if r.status_code == 401:
+        raise RollcallSessionExpired(f"签到列表登录已失效 ({info})")
+    if r.status_code != 200:
+        raise RuntimeError(f"签到列表接口异常 ({info})")
+    try:
+        data = r.json()
+    except ValueError:
+        raise RuntimeError(f"签到列表响应不是 JSON ({info})") from None
     if isinstance(data, dict):
-        return data.get("rollcalls", data.get("data", []))
-    return []
+        data = data.get("rollcalls", data.get("data"))
+    if not isinstance(data, list) or not all(isinstance(rc, dict) for rc in data):
+        raise RuntimeError(f"签到列表响应结构异常 ({info})")
+    return data
 
 
 def get_rollcall_detail(rollcall_id, session):
@@ -689,6 +703,8 @@ def main_loop():
 
     # 3. 监控循环
     seen = set()                # 已处理终端 / 已成功签到的 rid
+    initialized_courses = set() # 每门课第一次成功查询时，历史不支持类型静默跳过
+    poll_errors = {}            # cid → (错误描述, 连续失败次数)
     unknown_retries = {}        # rid → 未知状态重试次数
     throttle_waiting = set()    # 已报过 [NEW]、还没收尾的 rid（[NEW] 只报一次靠它）
     events = []
@@ -708,10 +724,25 @@ def main_loop():
                 name = course_names.get(cid, "?")
                 try:
                     rollcalls = get_rollcalls(cid, session, student_id)
+                except RollcallSessionExpired as e:
+                    print(f"[登录] {e}，重新登录后重试")
+                    session, student_id = do_login()
+                    if not session or not student_id:
+                        return False
+                    continue
                 except Exception as e:
-                    print(f"[!] 获取 {name} 签到列表失败: {e}")
+                    error = str(e)
+                    previous, failures = poll_errors.get(cid, (None, 0))
+                    poll_errors[cid] = (error, failures + 1)
+                    if error != previous:
+                        print(f"[!] 获取 {name} 签到列表失败: {error}，将在下一轮重试")
                     continue
 
+                if cid in poll_errors:
+                    _, failures = poll_errors.pop(cid)
+                    print(f"[恢复] {name} 签到列表查询恢复（此前连续失败 {failures} 次）")
+                initial_poll = cid not in initialized_courses
+                initialized_courses.add(cid)
                 query_count += 1
 
                 for rc in rollcalls:
@@ -748,7 +779,8 @@ def main_loop():
 
                     # 非数字 / GPS 点名无法自动提交，不应当成状态获取失败重试。
                     if not (is_num or is_radar):
-                        events.append(f"[SKIP] {name} 不支持的签到类型，跳过")
+                        if not initial_poll:
+                            events.append(f"[SKIP] {name} 不支持的签到类型，跳过")
                         seen.add(rid)
                         continue
 
