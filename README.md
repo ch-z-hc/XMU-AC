@@ -26,7 +26,7 @@ python auto_checkin.py
 
 补查结果只接受点名 ID 和课程 ID 都匹配的四位数字字符串，保留前导零。不缓存签到码；补查失败或没有匹配记录时不提交，等下一轮重查。人数、本人状态、结束时间仍沿用旧接口，GPS 和节流逻辑不变。
 
-离线回归检查：`python test_number_code.py`，不需要账号或第三方依赖，不会访问网络或执行真实签到。
+离线回归检查：`python test_number_code.py` 和 `python test_checkin.py`，不需要账号或第三方依赖，不会访问网络或执行真实签到。
 
 ## 签到节流（等同学先签）
 
@@ -47,7 +47,7 @@ CHECKIN_RATIO = 0.30        # 超过此比例才签，改成 0 关闭该优化
 [GO] 高等数学 已签到 8/20 (40%) 达标，开签
 ```
 
-已签人数按名单里每人的 `rollcall_status == "on_call_fine"` 统计（名单接口 `GET /api/rollcall/{id}/student_rollcalls`），总人数即名单长度；若接口没有 `rollcall_status` 字段则退回按 `updated_at` 是否写入判。注意名单里每人的 `updated_at` 从建记录起就有值（等于点名创建时间），`status` 恒为 `on_call`，**都不能**用来判已签。
+已签人数按名单里每人的 `rollcall_status == "on_call_fine"` 统计（名单接口 `GET /api/rollcall/{id}/student_rollcalls`），总人数即名单长度；任一记录缺少 `rollcall_status` 字段或结构不完整时，视为判据不可信，本轮不节流。字段存在但值为 `null` 表示尚未签到。注意名单里每人的 `updated_at` 从建记录起就有值（等于点名创建时间），`status` 恒为 `on_call`，**都不能**用来判已签。
 
 拿不到名单（接口异常、返回空）或自校发现判据与接口口径不符（自己还没签却被算成已签）时立即签到，不因节流错过签到。
 

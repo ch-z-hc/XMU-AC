@@ -288,21 +288,13 @@ def answer_number(rollcall_id, code, session):
         return False
 
 
-# 名单里判断「某人已签到」的依据：优先用每人的 rollcall_status（签到后变
-# on_call_fine）；若接口无此字段，退回旧口径（签到时才写 updated_at）。
+# 只用名单里的 rollcall_status 判断是否已签；缺字段时由名单层面放弃节流。
 SIGNED_STUDENT_STATUS = "on_call_fine"
 
 
-def _student_signed(rec, use_status):
-    """按名单里的单条记录判断该学生是否已签到。
-
-    use_status 在名单层面统一定口径，且看字段是否存在而不是看值：无人签到时
-    rollcall_status 会全为 null，按值判断会误退回 updated_at；也不逐条判断，
-    已签者有值、未签者为 null 的接口逐条退回会把未签算成已签。
-    """
-    if use_status:
-        return rec.get("rollcall_status") == SIGNED_STUDENT_STATUS
-    return bool(rec.get("updated_at"))
+def _student_signed(rec):
+    """null 表示尚未签到；updated_at 和 status 均不能替代签到状态。"""
+    return rec.get("rollcall_status") == SIGNED_STUDENT_STATUS
 
 
 def _find_me(students):
@@ -363,15 +355,14 @@ def get_signed_stats(rollcall_id, session):
         students = data.get("student_rollcalls") if isinstance(data, dict) else None
         if not isinstance(students, list) or not students:
             return None, None
-        students = [s for s in students if isinstance(s, dict)]
-        if not students:
-            return None, None        # 全被过滤时不能让下游除零
-        use_status = any("rollcall_status" in s for s in students)
+        if not all(isinstance(s, dict) and "rollcall_status" in s for s in students):
+            print("  [!] 签到名单缺少可信的 rollcall_status，本次不节流")
+            return None, None
         me = _find_me(students)
-        if me is not None and _student_signed(me, use_status):
+        if me is not None and _student_signed(me):
             print("  [!] 签到人数判据与接口不符（自己未签却被计为已签），本次不节流")
             return None, None
-        return sum(1 for s in students if _student_signed(s, use_status)), len(students)
+        return sum(1 for s in students if _student_signed(s)), len(students)
     except Exception as e:
         print(f"  [X] 查询签到人数失败: {e}")
         return None, None
