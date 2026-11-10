@@ -397,7 +397,7 @@ def answer_qr(rollcall_id, token, session):
 
 
 def submit_qr_payload(payload, session, student_id, courses):
-    """手动载荷也必须匹配本人课程、当前点名并经过比例闸门。"""
+    """手动载荷匹配本人课程和当前点名后直接提交，不等待已签比例。"""
     parsed = parse_qr_payload(payload)
     if parsed is None:
         return False, "无法解析二维码载荷"
@@ -424,9 +424,6 @@ def submit_qr_payload(payload, session, student_id, courses):
             return False, "本次点名已结束或无需签到"
         if rc.get("status") not in ACTIVE_STATUSES:
             return False, "本人签到状态不明确，请重试"
-        need_wait, message = checkin_gate(rid, session)
-        if need_wait:
-            return False, message + "；达标后请提供新码"
         if _end_time_passed(end_time):
             return False, "本次点名已结束"
         return answer_qr(rid, parsed["data"], session)

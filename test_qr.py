@@ -132,11 +132,12 @@ class QrTests(unittest.TestCase):
                                            session, 1, COURSES)
         return result, answer
 
-    def test_manual_obeys_gate_and_target(self):
+    def test_manual_skips_gate_but_checks_target(self):
         for signed in (0, 3):
-            result, answer = self.manual(signed=signed)
-            self.assertFalse(result[0])
-            answer.assert_not_called()
+            with patch.object(app, "checkin_gate", side_effect=AssertionError("manual must not throttle")):
+                result, answer = self.manual(signed=signed)
+            self.assertTrue(result[0])
+            answer.assert_called_once()
         result, answer = self.manual(signed=4)
         self.assertTrue(result[0])
         answer.assert_called_once()
