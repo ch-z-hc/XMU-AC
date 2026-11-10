@@ -28,6 +28,26 @@ python auto_checkin.py
 
 离线回归检查：`python test_number_code.py` 和 `python test_checkin.py`，不需要账号或第三方依赖，不会访问网络或执行真实签到。
 
+## 二维码签到
+
+检测 `is_qr=true` 或 `type=qr_rollcall` 的点名。每轮按本人状态和详情中的结束时间检查，比例达标后请求 `GET /api/course/{course_id}/rollcall/{rollcall_id}/qr_code`，从 `data` 或 `qr_code` 读取载荷，随即通过 `PUT /api/rollcall/{rollcall_id}/answer_qr_rollcall` 提交 `{data, deviceId}`。
+
+沿用 15 秒轮询；每次提交前重新取码，不缓存载荷。HTTP 200 后还要回查名单，只有本人的 `rollcall_status` 为 `on_call_fine` 才记录成功。取码无权限、载荷过期或提交未确认时保留重试，下一轮先查本人状态，避免成功后的重复提交。详情显示点名已结束时停止处理。
+
+学生会话不一定有取码权限。自动取码失败时，可另开终端使用同一账号运行：
+
+```sh
+python auto_checkin.py --qr
+```
+
+先完成登录，再在提示后粘贴最新扫码内容，空行退出。支持 JSON、`!key~value` 紧凑编码，以及 `p`、`_p`、`_wg_p` 参数包装的 URL / 深链。这里只解析扫码得到的文本，不识别图片，也不访问载荷中的链接。
+
+手动入口核对本人监控课程、点名 ID、类型和当前状态，并使用同一比例闸门。未超过 30% 时不提交，也不保存旧码；达标后需重新提供最新载荷。二维码时效由服务端判断，不能保证所有租户都能免扫码自动签到。
+
+二维码 `data` 不写日志、不落盘。实现参考 [tronclass-autosigner](https://github.com/zxyzhk/tronclass-autosigner) 的载荷格式与接口；保留真实载荷取码和提交流程，不使用伪造载荷探测或将 HTTP 200 直接当作成功。许可见 [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)。
+
+离线检查：`python test_qr.py`，覆盖载荷格式、权限与响应异常、本人状态回查、30% 边界、结束处理和重试。与 `python test_checkin.py`、`python test_number_code.py` 一起运行；均不读取真实账号或调用真实签到。
+
 ## 签到节流（等同学先签）
 
 默认不当第一个签到的人：提交前先查本次签到的班级名单，等已签到比例**超过 30%** 再签。参数在 `auto_checkin.py` 顶部：
@@ -38,9 +58,9 @@ CHECKIN_RATIO = 0.30        # 超过此比例才签，改成 0 关闭该优化
 
 已签到比例必须严格超过 30%；恰好 30% 时仍等待。没有等待时长或剩余时间兜底，比例始终未达标时会等待到点名结束，不提交签到。名单接口异常、人数无法取得或判据不可信时，则跳过比例限制。
 
-通过 `end_time` 判断点名是否结束，到点记录 `[END]` 并停止轮询该场次。而 `end_time` 只有点名详情接口给（课程列表里恒为 `None`，`is_expired` 即使 `finished` 也仍是 `False`），所以数字和 GPS 都会去读一次详情。
+通过 `end_time` 判断点名是否结束，到点记录 `[END]` 并停止轮询该场次。而 `end_time` 只有点名详情接口给（课程列表里恒为 `None`，`is_expired` 即使 `finished` 也仍是 `False`），所以数字、GPS 和二维码都会去读一次详情。
 
-数字签到和 GPS 签到共用这套节流。等待是**非阻塞**的：未达标的签到只记在 `throttle_waiting` 里，下个轮询周期（15 秒）重新判断，期间的其他课程照常处理。控制台用 `[WAIT]` / `[GO]` 事件显示实时人数，例如：
+数字、GPS 和二维码签到共用这套节流，手动粘贴二维码也不例外。等待是**非阻塞**的：未达标的签到只记在 `throttle_waiting` 里，下个轮询周期（15 秒）重新判断，期间的其他课程照常处理。控制台用 `[WAIT]` / `[GO]` 事件显示实时人数，例如：
 
 ```text
 [WAIT] 高等数学 已签到 4/20 (20%) 未达 30%，继续等

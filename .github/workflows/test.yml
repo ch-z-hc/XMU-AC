@@ -12,3 +12,4 @@ jobs:
           python-version: '3.12'
       - run: python test_checkin.py
       - run: python test_number_code.py
+      - run: python test_qr.py

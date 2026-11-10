@@ -3,6 +3,7 @@ XMU Tronclass 全自动签到脚本
 - xmulogin 纯 API CAS 登录（无浏览器，稳定）
 - Cookie 持久化（重启免登录）
 - 数字签到：API 直接抓码 → 提交
+- 二维码签到：读取短时有效载荷，或通过 --qr 粘贴扫码结果 → 提交并回查
 - GPS 签到：两条线三角定位自动算坐标 → 提交
   提交后按名单里本人那条 rollcall_status 确认是否真签上（不是看点名状态）
 - 签到节流：等班级超过 CHECKIN_RATIO 的人签过之后再签（避免第一个签）
@@ -18,11 +19,14 @@ import getpass
 import json
 import math
 import os
+import re
+import sys
 import time
 import unicodedata
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import unquote
 
 import requests
 from xmulogin import xmulogin
@@ -286,6 +290,168 @@ def answer_number(rollcall_id, code, session):
     except Exception as e:
         print(f"  [X] 提交签到失败: {e}")
         return False
+
+
+def is_qr_rollcall(rollcall):
+    return rollcall.get("is_qr") is True or rollcall.get("type") == "qr_rollcall"
+
+
+def parse_qr_payload(text):
+    """解析 JSON、旧版紧凑编码或 URL/深链，只返回签到所需字段。
+
+    协议参考 zxyzhk/tronclass-autosigner；许可证见 THIRD_PARTY_NOTICES.md。
+    URL 只解析，不访问；data 不做二次解码，保留 +、~、! 等原始字符。
+    """
+    if not isinstance(text, str) or len(text) > 16384:
+        return None
+    raw = text.strip(" \t\r\n")
+    if not raw.startswith("{"):
+        match = re.search(r"[?&](?:_wg_p|p|_p)=([^&#]*)", raw)
+        if match:
+            raw = unquote(match.group(1)).strip(" \t\r\n")
+    try:
+        if raw.startswith("{"):
+            obj = json.loads(raw)
+        else:
+            obj = {}
+            fields = {"0": "courseId", "3": "data", "4": "rollcallId"}
+            for part in raw.strip("!").split("!"):
+                key, value = part.split("~", 1)
+                if key not in fields:
+                    continue
+                field = fields[key]
+                if field in obj:
+                    return None
+                if value.startswith(chr(16)):
+                    value = int(value[1:], 36)
+                else:
+                    value = value.replace(chr(31), "~").replace(chr(30), "!")
+                obj[field] = value
+        if not isinstance(obj, dict):
+            return None
+        result = {}
+        for field in ("rollcallId", "courseId"):
+            if field == "courseId" and field not in obj:
+                continue
+            value = obj.get(field)
+            if type(value) not in (int, str) or not re.fullmatch(r"[0-9]+", str(value)):
+                return None
+            if int(value) <= 0:
+                return None
+            result[field] = str(int(value))
+        data = obj.get("data")
+        if not isinstance(data, str) or not data.strip():
+            return None
+        result["data"] = data
+        return result
+    except (ValueError, TypeError):
+        return None
+
+
+def get_qr_token(rollcall_id, course_id, session):
+    """用当前学生会话取新码；不缓存载荷，不打印响应正文。"""
+    try:
+        r = session.get(
+            f"{BASE_URL}/api/course/{course_id}/rollcall/{rollcall_id}/qr_code",
+            timeout=10)
+        if r.status_code != 200:
+            return None, f"取码接口 HTTP {r.status_code}"
+        body = r.json()
+        if isinstance(body, dict):
+            for field in ("data", "qr_code"):
+                token = body.get(field)
+                if isinstance(token, str) and token.strip():
+                    return token, ""
+        return None, "取码接口未返回有效载荷"
+    except Exception:
+        return None, "取码接口请求失败"
+
+
+def answer_qr(rollcall_id, token, session):
+    """提交真实载荷，并以名单中本人的状态确认结果。"""
+    if not isinstance(token, str) or not token.strip():
+        return False, "缺少有效载荷"
+    try:
+        r = session.put(
+            f"{BASE_URL}/api/rollcall/{rollcall_id}/answer_qr_rollcall",
+            json={"data": token, "deviceId": str(uuid.uuid4())}, timeout=10)
+        if r.status_code != 200:
+            # 不回显服务端任意 message，防止把短时载荷或账号写入日志。
+            reason = f"提交接口 HTTP {r.status_code}"
+            try:
+                body = r.json()
+                if isinstance(body, dict):
+                    for key in ("error", "code", "error_code"):
+                        if body.get(key) in ("qr_code_expired", "invalid_create_time_hash",
+                                            "invalid_qr_create_time", "no_request_data"):
+                            reason += f" ({body[key]})"
+                            break
+            except ValueError:
+                pass
+            return False, reason
+    except Exception:
+        return False, "二维码提交请求失败"
+    if check_my_checkin_status(rollcall_id, session) != SIGNED_STUDENT_STATUS:
+        return False, "尚未确认本人已签，下轮先复查状态"
+    return True, "本人状态已确认"
+
+
+def submit_qr_payload(payload, session, student_id, courses):
+    """手动载荷也必须匹配本人课程、当前点名并经过比例闸门。"""
+    parsed = parse_qr_payload(payload)
+    if parsed is None:
+        return False, "无法解析二维码载荷"
+    rid = parsed["rollcallId"]
+    for course in courses:
+        cid = course["id"]
+        if "courseId" in parsed and parsed["courseId"] != str(cid):
+            continue
+        try:
+            rows = get_rollcalls(cid, session, student_id)
+        except Exception:
+            return False, "签到列表查询失败，请重试或重新登录"
+        rc = next((row for row in rows
+                   if str(row.get("id") or row.get("rollcall_id")) == rid), None)
+        if rc is None:
+            continue
+        if not is_qr_rollcall(rc):
+            return False, "目标不是二维码点名"
+        if rc.get("status") == SIGNED_STUDENT_STATUS:
+            return True, "本人已签到，无需重复提交"
+        _, detail_status, end_time = get_rollcall_detail(rid, session)
+        if (_is_terminal(rc.get("status"), end_time)
+                or _is_terminal(detail_status, end_time)):
+            return False, "本次点名已结束或无需签到"
+        if rc.get("status") not in ACTIVE_STATUSES:
+            return False, "本人签到状态不明确，请重试"
+        need_wait, message = checkin_gate(rid, session)
+        if need_wait:
+            return False, message + "；达标后请提供新码"
+        if _end_time_passed(end_time):
+            return False, "本次点名已结束"
+        return answer_qr(rid, parsed["data"], session)
+    return False, "本人监控课程中未找到匹配的点名"
+
+
+def qr_cli():
+    # 先完成登录，再接收短时载荷，避免码在登录期间过期。
+    session, student_id = do_login()
+    if not session or not student_id:
+        print("[错误] 登录失败")
+        return 1
+    courses = get_courses(session)
+    if not courses:
+        print("[错误] 获取课程列表失败")
+        return 1
+    while True:
+        try:
+            payload = input("粘贴最新二维码内容（空行退出）: ").strip(" \t\r\n")
+        except (EOFError, KeyboardInterrupt):
+            return 0
+        if not payload:
+            return 0
+        ok, message = submit_qr_payload(payload, session, student_id, courses)
+        print(f"[{'OK' if ok else '!'}] {message}")
 
 
 # 只用名单里的 rollcall_status 判断是否已签；缺字段时由名单层面放弃节流。
@@ -604,6 +770,8 @@ def _is_terminal(status, end_time):
 
 
 def rollcall_label(rollcall):
+    if is_qr_rollcall(rollcall):
+        return "二维码"
     if rollcall.get("is_radar"):
         return "GPS"
     if rollcall.get("is_number"):
@@ -749,17 +917,19 @@ def main_loop():
                     # 但点名还没结束的那场重复签一遍（重启后最容易撞上）。
                     # 列表里也不给 end_time（恒 None），而「点名结束了没有」全靠它判 ——
                     # 没到比例的那些就是靠它收尾的，不然会永远在轮询里空转。
-                    is_num = rc.get("is_number") and not rc.get("is_radar")
+                    is_qr = is_qr_rollcall(rc)
+                    is_num = rc.get("is_number") and not rc.get("is_radar") and not is_qr
                     is_radar = bool(rc.get("is_radar"))
-                    code = end_time = None
+                    code = end_time = detail_status = None
                     if is_num:
                         code, _, end_time = get_rollcall_detail(rid, session)
-                    elif is_radar:
-                        _, _, end_time = get_rollcall_detail(rid, session)
+                    elif is_radar or is_qr:
+                        _, detail_status, end_time = get_rollcall_detail(rid, session)
                     status = rc.get("status")
 
                     # 终端状态 → 标记已处理，不再重试
-                    if _is_terminal(status, end_time):
+                    if (_is_terminal(status, end_time)
+                            or (is_qr and _is_terminal(detail_status, end_time))):
                         # 之前对它报过 [NEW]（进过 throttle_waiting）才补一行收尾，
                         # 否则日志会停在 [FAIL] 将重试 上看不出最终结果；
                         # 启动时批量吐掉的历史点名不在里面，不会刷屏。
@@ -768,8 +938,8 @@ def main_loop():
                         seen.add(rid)
                         continue
 
-                    # 非数字 / GPS 点名无法自动提交，不应当成状态获取失败重试。
-                    if not (is_num or is_radar):
+                    # 非数字 / GPS / 二维码点名无法自动提交，不应当成状态获取失败重试。
+                    if not (is_num or is_radar or is_qr):
                         if not initial_poll:
                             events.append(f"[SKIP] {name} 不支持的签到类型，跳过")
                         seen.add(rid)
@@ -800,7 +970,7 @@ def main_loop():
                     # 签到节流：等班级超过 CHECKIN_RATIO 的人签过之后再签，没到就一直等。
                     # 等待期间 [NEW] 只报一次，否则每个轮询周期都会刷屏。
                     # CHECKIN_RATIO=0 时整块跳过，保持无节流时的原始行为。
-                    if CHECKIN_RATIO > 0 and (rc.get("is_number") or rc.get("is_radar")):
+                    if CHECKIN_RATIO > 0:
                         if rid not in throttle_waiting:
                             events.append(f"[NEW] {name} ({rtype})")
                             throttle_waiting.add(rid)
@@ -813,7 +983,21 @@ def main_loop():
                     else:
                         events.append(f"[NEW] {name} ({rtype})")
 
-                    if rc.get("is_number") and not rc.get("is_radar"):
+                    if is_qr:
+                        if _end_time_passed(end_time):
+                            continue
+                        token, reason = get_qr_token(rid, cid, session)
+                        if token is None:
+                            events.append(f"[!] 二维码 {name} {reason}；可用 --qr 粘贴扫码内容")
+                            continue
+                        ok, reason = answer_qr(rid, token, session)
+                        if ok:
+                            seen.add(rid)
+                            events.append(f"[OK] 二维码 {name} 本人状态已确认")
+                        else:
+                            events.append(f"[FAIL] 二维码 {name} {reason}，将重试")
+
+                    elif is_num:
                         if not code:
                             code = get_number_code_from_timetable(
                                 rid, cid, rc.get("rollcall_time"), session)
@@ -897,4 +1081,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["--qr"]:
+        sys.exit(qr_cli())
+    elif sys.argv[1:]:
+        print("用法: python auto_checkin.py [--qr]")
+        sys.exit(2)
+    else:
+        main()
